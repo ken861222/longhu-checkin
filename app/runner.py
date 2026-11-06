@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from . import db, longhu
+from . import db, dxidentity, longhu
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +124,15 @@ def _app_entry(account: dict, item: dict, mode: str) -> tuple[str, str]:
     if mode == "off":
         return "skipped", f"{label}已关闭"
     if not (account.get("dx_token") or "").strip():
-        # 没有 App 内真实指纹时不要硬打：udid/c1 现造的指纹必被判风险，
-        # 攒的全是负面记录，还会把账号拖进 8040012 的坑里
-        return "todo", f"{label}未配置设备指纹，跳过（每个账号要填一份独立指纹，重装 App 可换新）"
+        # 没指纹时先自动造一份（服务端生成，不需要浏览器）。造成功才继续；
+        # 失败就退回 todo 提示用户点「补指纹」，不去硬打 udid/c1 那种必被判风险的现造指纹。
+        fingerprint, message = dxidentity.generate(account)
+        if not fingerprint:
+            return "todo", f"{label}未配置设备指纹（{message}）。点「补指纹」生成一份"
+        db.update_account(account["id"], dx_token=fingerprint)
+        account["dx_token"] = fingerprint
+        db.add_log(account["id"], account["name"], "dx", "ok",
+                   f"首次签到自动生成指纹（{message}），激活前若报 8040012 请点「重置指纹」过滑块")
     if mode == "auto":
         return longhu.checkin(account, item["activity_no"], label)
 

@@ -3,6 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- 顶象 SDK 在 s.longfor.com 上配了 Referer ACL：带本站（如 127.0.0.1）的
+     Referer 会被 403 挡成 HTML，浏览器再按 ORB 拦掉，表现为“脚本没加载出来”。
+     置空 Referer 即可正常拉取；滑块接口本身不校验 Referer。 -->
+<meta name="referrer" content="no-referrer">
 <title>龙湖签到</title>
 <style>
   :root {
@@ -272,6 +276,7 @@
 
 <div id="toast"></div>
 
+<script src="/static/slider.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 let accounts = [];
@@ -359,7 +364,7 @@ function renderAccounts() {
       <div class="card-foot">
         <div class="msg" title="${escapeHtml(a.last_message || "")}">${escapeHtml(a.last_message || "尚未执行")}</div>
         <button class="small" data-sched="${a.id}">时间</button>
-        <button class="small" data-dx="${a.id}">${a.has_dx ? "换指纹" : "补指纹"}</button>
+        <button class="small" data-dx="${a.id}">${a.has_dx ? "重置指纹" : "补指纹"}</button>
         <button class="small" data-run="${a.id}">立即签到</button>
         <button class="small danger" data-del="${a.id}">删除</button>
       </div>
@@ -459,6 +464,78 @@ $("btnSubmitAdd").onclick = async () => {
   }
 };
 
+// 重置指纹：服务端生成 → 浏览器过滑块 → 落库。失败可退回手动粘贴。
+async function resetFingerprint(acc) {
+  if (!window.DXSlider) {
+    manualFingerprint(acc);
+    return;
+  }
+  let prepared;
+  try {
+    toast(`正在为「${acc.name}」生成指纹…`);
+    prepared = await api(`/api/accounts/${acc.id}/dx/prepare`, { method: "POST" });
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  if (!prepared.ok) {
+    toast(prepared.message || "生成指纹失败", true);
+    return;
+  }
+
+  // 先自动识别（轮廓×边缘距离场），连输两次后再退到手动拖。
+  let r = null;
+  for (let i = 0; i < 2; i++) {
+    r = await DXSlider.solve(prepared.fingerprint, {
+      onStatus: (text) => {
+        if (text === 'dragging') toast(`自动拖动中（第 ${i + 1} 次）…`);
+      },
+    });
+    if (r.ok) break;
+    if (r.stage === 'solve' || r.stage === 'challenge' || r.stage === 'sdk') break;
+    toast(`自动识别没过（${r.error || r.stage}），换一道再试…`);
+  }
+  if (!r.ok) {
+    toast(`自动识别没过，改为手动拖一次`, true);
+    r = await DXSlider.solveManual(prepared.fingerprint, {
+      timeoutMs: 180000,
+      onStatus: (text) => {
+        if (text === 'manual') toast("请把拼块拖到缺口处");
+      },
+    });
+  }
+  if (!r.ok) {
+    toast(`滑块未通过：${r.error || r.stage || "未知原因"}`, true);
+    if (confirm("自动过滑块失败，改成手动粘贴指纹？")) manualFingerprint(acc);
+    return;
+  }
+
+  try {
+    const fd = new FormData();
+    fd.append("fingerprint", prepared.fingerprint);
+    fd.append("captcha_token", r.token);
+    await api(`/api/accounts/${acc.id}/dx/commit`, { method: "POST", body: fd });
+    toast("设备指纹已重置并激活");
+    await loadAll();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function manualFingerprint(acc) {
+  const value = prompt(
+    "粘贴 App 内的顶象设备指纹（形如 6ae93a6cUDMfhHgK6eYXWjqtu1qMG9bAJdij8Er1）。\n" +
+    "注意：每个账号必须用不同的指纹，共用会触发风控。\n" +
+    "留空表示清除。"
+  );
+  if (value === null) return;
+  const fd = new FormData();
+  fd.append("dx_token", value.trim());
+  api(`/api/accounts/${acc.id}/dx`, { method: "POST", body: fd })
+    .then(() => { toast(value.trim() ? "设备指纹已保存" : "已清除"); return loadAll(); })
+    .catch((e) => toast(e.message, true));
+}
+
 $("accounts").addEventListener("click", async (ev) => {
   const runId = ev.target.dataset.run;
   const delId = ev.target.dataset.del;
@@ -476,22 +553,8 @@ $("accounts").addEventListener("click", async (ev) => {
     $("modalSchedule").classList.add("show");
   }
   if (dxId) {
-    const value = prompt(
-      "粘贴 App 内的顶象设备指纹（形如 6ae93a6cUDMfhHgK6eYXWjqtu1qMG9bAJdij8Er1）。\n" +
-      "注意：每个账号必须用不同的指纹，共用会触发风控。\n" +
-      "重装 App 会生成新指纹；Mac 上跑 python tools/read_mac_app.py 可直接读出。\n" +
-      "留空表示清除。"
-    );
-    if (value === null) return;
-    try {
-      const fd = new FormData();
-      fd.append("dx_token", value.trim());
-      await api(`/api/accounts/${dxId}/dx`, { method: "POST", body: fd });
-      toast(value.trim() ? "设备指纹已保存" : "已清除");
-      await loadAll();
-    } catch (e) {
-      toast(e.message, true);
-    }
+    const acc = accounts.find((a) => String(a.id) === String(dxId));
+    if (acc) await resetFingerprint(acc);
   }
   if (runId) {
     const btn = ev.target;

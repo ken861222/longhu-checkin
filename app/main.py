@@ -10,7 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db, longhu, parser, runner, scheduler
+from . import db, dxidentity, longhu, parser, runner, scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,6 +210,61 @@ def api_set_dx(account_id: int, dx_token: str = Form("")):
     db.add_log(account_id, account["name"], "dx",
                "ok" if value else "fail", "已保存设备指纹" if value else "已清除设备指纹")
     return {"ok": True, "has_dx": bool(value)}
+
+
+@app.post("/api/accounts/{account_id}/dx/prepare")
+def api_dx_prepare(account_id: int):
+    """第一步：服务端按账号 token 生成一份新指纹，等浏览器过滑块激活。
+
+    生成不需要浏览器（纯标准库派生），激活必须在用户浏览器里跑顶象 SDK，
+    所以拆成 prepare/commit 两步：这一步只造指纹并暂存 10 分钟。
+    """
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "账号不存在")
+
+    fingerprint, message = dxidentity.generate(account)
+    if not fingerprint:
+        db.add_log(account_id, account["name"], "dx", "fail", f"生成指纹失败：{message}")
+        return {"ok": False, "message": message}
+
+    dxidentity.put_pending(account_id, fingerprint)
+    logger.info("[%s] 已生成待激活指纹: %s", account["name"], message)
+    return {
+        "ok": True,
+        "fingerprint": fingerprint,
+        "message": message,
+        "has_dx": bool((account.get("dx_token") or "").strip()),
+    }
+
+
+@app.post("/api/accounts/{account_id}/dx/commit")
+def api_dx_commit(account_id: int, fingerprint: str = Form(""),
+                  captcha_token: str = Form("")):
+    """第二步：浏览器过完滑块，把（已绑定滑块 token 的）指纹落库。"""
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "账号不存在")
+
+    value = fingerprint.strip()
+    captcha = captcha_token.strip()
+    if not value or not captcha:
+        raise HTTPException(400, "缺少指纹或激活凭据（滑块没通过？）")
+
+    # 只接受 prepare 阶段发出去的那一份，防止前端乱传
+    pending = dxidentity.take_pending(account_id)
+    if pending != value:
+        raise HTTPException(400, "指纹已过期，请重新点一次「重置指纹」")
+
+    others = db.accounts_with_dx(value, exclude_id=account_id)
+    if others:
+        names = "、".join(a["name"] for a in others)
+        raise HTTPException(400, f"这个指纹已被「{names}」占用，请重新生成")
+
+    db.update_account(account_id, dx_token=value)
+    dxidentity.drop_pending(account_id)
+    db.add_log(account_id, account["name"], "dx", "ok", "已重置并激活设备指纹")
+    return {"ok": True, "has_dx": True}
 
 
 @app.delete("/api/accounts/{account_id}")
